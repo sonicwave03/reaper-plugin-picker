@@ -1,5 +1,6 @@
--- @description Visual Plugin Picker (grid of plugin screenshots)
--- @version 2.0
+-- @description Plugin Picker
+-- @author sonicwave03
+-- @version 0.1
 -- @about
 --   A visual, screenshot-based plugin browser for REAPER.
 --   * You curate a library of only the plugins you use ("Add plugins")
