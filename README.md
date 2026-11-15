@@ -4,6 +4,8 @@
 
 A visual, screenshot-based plugin browser for REAPER. Build a curated FX library, organize plugins into groups, search, and add plugins to tracks or takes.
 
+**Development note:** This script is vibe-coded.
+
 ## Features
 
 * Curated library populated from REAPER's installed effects.
@@ -19,6 +21,8 @@ A visual, screenshot-based plugin browser for REAPER. Build a curated FX library
 * Optional REAPER toolbar toggle-state integration.
 
 ## Requirements
+
+**Platform note:** This script has only been confirmed to work on Windows. Other operating systems have not been tested.
 
 * REAPER 6.0 or newer is recommended.
 * **ReaImGui** is required. Install it through **Extensions > ReaPack > Browse packages**, then restart REAPER.
