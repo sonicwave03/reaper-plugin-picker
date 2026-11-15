@@ -73,6 +73,8 @@ Choose **Selected tracks**, **Master track**, or **Selected items (take FX)** fr
 
 ### Screenshots
 
+![Plugin Picker showing the group tabs and plugin grid](./screenshot.png)
+
 * In **Settings**, enable **Auto-capture when adding to library**, or use **Capture all missing** / **Re-capture all**.
 * To capture manually, right-click a tile and choose **Capture screenshot**. With a Ctrl-selected batch, the menu offers a batch screenshot action.
 * Capture methods are **Screen grab** and **Window copy**. Capturing briefly opens each plugin on a temporary track.
