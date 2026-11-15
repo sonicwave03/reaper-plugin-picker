@@ -1,4 +1,5 @@
 -- @description Reaper Plugin Picker
+-- @author sonicwave03
 -- @version 1.0
 -- @about
 --   A visual, screenshot-based plugin browser for REAPER.
