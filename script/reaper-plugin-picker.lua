@@ -11,8 +11,9 @@
 --   * Font family/size, automatic system theme, and saveable color presets
 --   * Optional smoothing for drag previews and keyboard scrolling
 --   * Automatic plugin category filters based on plugin names and types
+--   * Filter plugins by vendor
 --   * Double-click a tile (or press Enter) to add the plugin
---   * Alt-click plugins to select multiple and move them into a group together
+--   * Ctrl-click plugins to select multiple and move them into a group together
 --   * Screenshot capture (optional) needs the js_ReaScriptAPI extension
 --
 --   Requires: ReaImGui (ReaPack).  Optional: js_ReaScriptAPI (ReaPack).
@@ -52,8 +53,11 @@ if DIR ~= LEGACY_DIR and r.RecursiveCreateDirectory(DIR, 0) ~= 0 then
   DIR = LEGACY_DIR
 end
 local SHOT_DIR = DIR .. 'shots/'
+local METADATA_FILE = DIR .. 'plugin-metadata.txt'
 r.RecursiveCreateDirectory(SHOT_DIR, 0)
 local HAS_JS = (r.JS_LICE_WritePNG ~= nil and r.JS_GDI_Blit ~= nil and r.JS_Window_GetClientRect ~= nil)
+local HAS_JS_WINDOW = (r.JS_Window_FromPoint ~= nil and r.JS_Window_GetParent ~= nil
+  and r.JS_Window_GetTitle ~= nil)
 
 local function copy_data_file(source, destination)
   local input, err = io.open(source, 'rb')
@@ -257,6 +261,7 @@ local DEFAULTS = {
   close_after = false, open_ui = true, auto_capture = false,
   cap_delay = 1.5, cap_method = 0,
   win_w = 780, win_h = 560, target = 0, cur_group = 'All', cur_category = 'All',
+  cur_vendor = 'All',
 }
 for _, d in ipairs(COLOR_DEFS) do
   if d.key then DEFAULTS['c_' .. d.key] = d.def end
@@ -354,6 +359,26 @@ local function toolbar_icon_button(id, tooltip, kind)
   return clicked
 end
 
+local function draw_favorites_star(dl, x, y, size, color)
+  local scale = size / 16
+  local function line(x1, y1, x2, y2)
+    ImGui.DrawList_AddLine(
+      dl, x + x1 * scale, y + y1 * scale, x + x2 * scale, y + y2 * scale,
+      color, 1.5 * scale)
+  end
+
+  local points = {}
+  for i = 0, 9 do
+    local radius = (i % 2 == 0) and 6.5 or 2.8
+    local angle = -math.pi / 2 + i * math.pi / 5
+    points[#points + 1] = { 8 + math.cos(angle) * radius, 8 + math.sin(angle) * radius }
+  end
+  for i, point in ipairs(points) do
+    local next_point = points[i % #points + 1]
+    line(point[1], point[2], next_point[1], next_point[2])
+  end
+end
+
 local function random_plugin_button(enabled)
   local scale = cfg.ui_scale
   local size = 44 * scale
@@ -403,11 +428,20 @@ local loads_this_frame = 0
 local next_auto_theme_check = 0
 
 local library, groups, lib_index = {}, {}, {}
+local FAVORITES_GROUP = 'Favorites'
 local installed, inst_list, types = {}, {}, {}
 local images = {}
 local image_sizes = {}
 local lbl_cache = {}
 local multi_selected = {}
+local metadata_overrides = {}
+local metadata_edit_name = nil
+local metadata_edit_category = 'Automatic'
+local metadata_edit_vendor = ''
+local rename_plugin_name, rename_plugin_value = nil, ''
+local rename_plugin_requested = false
+local pending_selected_plugin = nil
+local metadata_edit_requested = false
 
 local function set_status(msg) status, status_t = msg, os.time() end
 
@@ -634,6 +668,22 @@ local CATEGORY_FILTERS = {
   'All', 'Effects', 'EQ', 'Dynamics', 'Reverb', 'Delay', 'Modulation',
   'Distortion', 'Utility', 'Instrument', 'Other',
 }
+local CATEGORY_EDIT_OPTIONS = {
+  'Automatic', 'Effects', 'EQ', 'Dynamics', 'Reverb', 'Delay', 'Modulation',
+  'Distortion', 'Utility', 'Instrument', 'Other',
+}
+local CATEGORY_OVERRIDE_MAP = {
+  Effects = { 'Effects', 'Other' },
+  EQ = { 'Effects', 'EQ' },
+  Dynamics = { 'Effects', 'Dynamics' },
+  Reverb = { 'Effects', 'Reverb' },
+  Delay = { 'Effects', 'Delay' },
+  Modulation = { 'Effects', 'Modulation' },
+  Distortion = { 'Effects', 'Distortion' },
+  Utility = { 'Utility', 'Utility' },
+  Instrument = { 'Instrument', 'Instrument' },
+  Other = { 'Other', 'Other' },
+}
 local EFFECT_CATEGORY_ORDER = { 'EQ', 'Dynamics', 'Reverb', 'Delay', 'Modulation', 'Distortion' }
 
 local function has_category_keyword(text, keywords)
@@ -701,9 +751,27 @@ local function classify_plugin(name, ptype, inst)
   return 'Effects', 'Other'
 end
 
+local function classify_vendor(display, ptype)
+  local vendor = display:match('%(([^()]+)%)%s*$')
+    or display:match('^([^:]+):%s+.+$')
+  if vendor then
+    vendor = vendor:gsub('^%s+', ''):gsub('%s+$', '')
+    if vendor ~= '' then return vendor end
+  end
+  return ptype == 'JS' and 'JSFX' or 'Unknown'
+end
+
 local function make_entry(name, group_memberships)
   local ty, disp, inst = parse_name(name)
   local category, subcategory = classify_plugin(name, ty, inst)
+  local vendor = classify_vendor(disp, ty)
+  local override = metadata_overrides[name]
+  if override then
+    local category_override = CATEGORY_OVERRIDE_MAP[override.category]
+    if category_override then category, subcategory = category_override[1], category_override[2] end
+    if override.vendor then vendor = override.vendor end
+  end
+  local display = override and override.display or disp
   local entry_groups, seen = {}, {}
   if type(group_memberships) == 'string' then
     if group_memberships ~= '' then entry_groups[1] = group_memberships end
@@ -716,8 +784,9 @@ local function make_entry(name, group_memberships)
     end
   end
   return {
-    name = name, groups = entry_groups, type = ty, display = disp, inst = inst,
-    category = category, subcategory = subcategory, lower = name:lower(),
+    name = name, groups = entry_groups, type = ty, display = display, inst = inst,
+    category = category, subcategory = subcategory, vendor = vendor,
+    lower = (name .. ' ' .. display):lower(),
   }
 end
 
@@ -745,10 +814,147 @@ local function shot_path(name)
   return SHOT_DIR .. safe .. '.png'
 end
 
+local function load_metadata_overrides()
+  metadata_overrides = {}
+  local f, err = io.open(METADATA_FILE, 'r')
+  if not f then
+    if r.file_exists(METADATA_FILE) then
+      r.ShowConsoleMsg('Visual Plugin Picker: could not read plugin metadata: ' .. tostring(err) .. '\n')
+    end
+    return
+  end
+  for raw in f:lines() do
+    local line = raw:gsub('\r', '')
+    local name, category, vendor, display = line:match('^([^\t]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)$')
+    if not name then
+      name, category, vendor = line:match('^([^\t]+)\t([^\t]*)\t(.*)$')
+    end
+    if name and name ~= '' and (category == '' or CATEGORY_OVERRIDE_MAP[category]) then
+      category = category ~= '' and category or nil
+      vendor = vendor ~= '' and vendor or nil
+      display = display ~= '' and display or nil
+      if category or vendor or display then
+        metadata_overrides[name] = { category = category, vendor = vendor, display = display }
+      end
+    end
+  end
+  f:close()
+end
+
+local function save_metadata_overrides()
+  local f, err = io.open(METADATA_FILE, 'w')
+  if not f then
+    set_status('Could not save plugin metadata.')
+    r.ShowConsoleMsg('Visual Plugin Picker: could not save plugin metadata: ' .. tostring(err) .. '\n')
+    return false
+  end
+  local names = {}
+  for name in pairs(metadata_overrides) do names[#names + 1] = name end
+  table.sort(names)
+  local failure
+  for _, name in ipairs(names) do
+    local override = metadata_overrides[name]
+    local ok, write_err = f:write(
+      name, '\t', override.category or '', '\t', override.vendor or '',
+      '\t', override.display or '', '\n')
+    if not ok then failure = write_err; break end
+  end
+  local closed, close_err = f:close()
+  if failure or not closed then
+    local message = failure or close_err
+    set_status('Could not save plugin metadata.')
+    r.ShowConsoleMsg('Visual Plugin Picker: could not save plugin metadata: ' .. tostring(message) .. '\n')
+    return false
+  end
+  return true
+end
+
+local VENDOR_FILTERS = { 'All' }
+
 local function sort_library()
   table.sort(library, function(a, b) return a.display:lower() < b.display:lower() end)
   lib_index = {}
   for _, e in ipairs(library) do lib_index[e.name] = e end
+  local vendors, seen = {}, {}
+  for _, e in ipairs(library) do
+    local key = e.vendor:lower()
+    if not seen[key] then
+      vendors[#vendors + 1] = e.vendor
+      seen[key] = true
+    end
+  end
+  table.sort(vendors, function(a, b) return a:lower() < b:lower() end)
+  VENDOR_FILTERS = { 'All' }
+  for _, vendor in ipairs(vendors) do
+    VENDOR_FILTERS[#VENDOR_FILTERS + 1] = vendor
+  end
+  if cfg.cur_vendor ~= 'All' and not seen[cfg.cur_vendor:lower()] then
+    cfg.cur_vendor = 'All'
+  end
+end
+
+local function update_plugin_metadata(name, category_choice, vendor_text, display_text)
+  local entry = lib_index[name]
+  if not entry then
+    set_status('Could not update metadata: plugin is no longer in the library.')
+    return false
+  end
+  if category_choice ~= 'Automatic' and not CATEGORY_OVERRIDE_MAP[category_choice] then
+    set_status('Could not update metadata: invalid category.')
+    return false
+  end
+
+  local vendor = vendor_text:gsub('[%c]', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+  if #vendor > 128 then
+    set_status('Vendor name must be 128 characters or fewer.')
+    return false
+  end
+  local display
+  if display_text ~= nil then
+    display = display_text:gsub('[%c]', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+    if #display > 128 then
+      set_status('Plugin display name must be 128 characters or fewer.')
+      return false
+    end
+  end
+
+  local override = {}
+  if category_choice ~= 'Automatic' then override.category = category_choice end
+  local entry_type, detected_display = parse_name(name)
+  local detected_vendor = classify_vendor(detected_display, entry_type)
+  if vendor ~= '' and vendor ~= detected_vendor then
+    override.vendor = vendor
+  end
+  if display_text == nil then
+    local previous_override = metadata_overrides[name]
+    if previous_override and previous_override.display then override.display = previous_override.display end
+  elseif display ~= '' and display ~= detected_display then
+    override.display = display
+  end
+
+  local previous_override = metadata_overrides[name]
+  metadata_overrides[name] = (override.category or override.vendor or override.display) and override or nil
+  if not save_metadata_overrides() then
+    metadata_overrides[name] = previous_override
+    return false
+  end
+
+  local replacement = make_entry(name, entry.groups)
+  for i, current in ipairs(library) do
+    if current.name == name then
+      library[i] = replacement
+      break
+    end
+  end
+  sort_library()
+  clear_multi_selection()
+  if display_text ~= nil then
+    pending_selected_plugin = name
+    set_status(('Renamed plugin to "%s".'):format(replacement.display))
+  else
+    set_status(('Updated metadata for "%s".'):format(replacement.display))
+  end
+  return true
 end
 
 local function save_library()
@@ -774,7 +980,7 @@ local function load_library()
   if g then
     for raw in g:lines() do
       local line = raw:gsub('\r', '')
-      if line ~= '' then groups[#groups + 1] = line end
+      if line ~= '' and line ~= FAVORITES_GROUP then groups[#groups + 1] = line end
     end
     g:close()
   end
@@ -1023,7 +1229,7 @@ local function add_fx(e)
 end
 
 ---------------------------------------------------------------------
--- Drag & drop onto a track (TCP / mixer / arrange lane)
+-- Drag & drop onto a track (TCP / mixer / arrange lane) or its FX chain
 ---------------------------------------------------------------------
 local function add_fx_to_track(e, tr)
   r.Undo_BeginBlock()
@@ -1037,6 +1243,28 @@ local function add_fx_to_track(e, tr)
   end
   set_status('Could not add "' .. e.display .. '" (is it installed?).')
   return false
+end
+
+local function track_from_fx_chain_window(x, y)
+  if not HAS_JS_WINDOW or not r.TrackFX_GetChainVisible then return nil end
+  local hwnd = r.JS_Window_FromPoint(x, y)
+  for _ = 1, 16 do
+    if not hwnd then break end
+    local title = r.JS_Window_GetTitle(hwnd) or ''
+    local tr
+    if title:match('^FX: Master Track') then
+      tr = r.GetMasterTrack(0)
+    else
+      local track_number = tonumber(title:match('^FX: Track (%d+)'))
+      if track_number then tr = r.GetTrack(0, track_number - 1) end
+    end
+    if tr then
+      if r.TrackFX_GetChainVisible(tr) ~= -1 then return tr end
+      return nil
+    end
+    hwnd = r.JS_Window_GetParent(hwnd)
+  end
+  return nil
 end
 
 -- call once per frame; returns true when a plugin was dropped and added
@@ -1060,11 +1288,14 @@ local function handle_drag()
   else
     drag.mx, drag.my = x, y
   end
-  local tr = r.GetTrackFromPoint(x, y)
+  local tr = track_from_fx_chain_window(x, y)
+  local is_fx_chain = tr ~= nil
+  if not tr then tr = r.GetTrackFromPoint(x, y) end
   if tr then
     local _, nm = r.GetTrackName(tr)
     local num = math.floor(r.GetMediaTrackInfo_Value(tr, 'IP_TRACKNUMBER') or 0)
-    drag.target = (num > 0) and ('%d: %s'):format(num, nm) or nm
+    local label = (num > 0) and ('%d: %s'):format(num, nm) or nm
+    drag.target = is_fx_chain and ('FX chain: ' .. label) or label
   else
     drag.target = nil
   end
@@ -1073,7 +1304,9 @@ local function handle_drag()
   local e = drag.e
   drag = nil
   if tr then return add_fx_to_track(e, tr) end
-  set_status('Drag a plugin onto a track to add it.')
+  set_status(HAS_JS_WINDOW
+    and 'Drag onto a track or an open track FX chain to add the plugin.'
+    or 'Drag onto a track. FX-chain drops require js_ReaScriptAPI.')
   return false
 end
 
@@ -1161,12 +1394,8 @@ local function visible_items()
   local terms = terms_of(search)
   local searching = #terms > 0
   for _, e in ipairs(library) do
-    local ok
-    if searching then
-      ok = matches_terms(e.lower, terms)
-    else
-      ok = (cfg.cur_group == 'All') or entry_has_group(e, cfg.cur_group)
-    end
+    local ok = (cfg.cur_group == 'All') or entry_has_group(e, cfg.cur_group)
+    if searching then ok = ok and matches_terms(e.lower, terms) end
     if cfg.cur_category == 'Effects' then
       ok = ok and e.category == 'Effects'
     elseif cfg.cur_category == 'Other' then
@@ -1174,9 +1403,53 @@ local function visible_items()
     elseif cfg.cur_category ~= 'All' then
       ok = ok and e.subcategory == cfg.cur_category
     end
+    if cfg.cur_vendor ~= 'All' then
+      ok = ok and e.vendor:lower() == cfg.cur_vendor:lower()
+    end
     if ok then items[#items + 1] = e end
   end
   return items
+end
+
+local function set_category_filter(category)
+  cfg.cur_category = category or 'All'
+  sel = 1
+  clear_multi_selection()
+end
+
+local function set_vendor_filter(vendor)
+  cfg.cur_vendor = vendor or 'All'
+  sel = 1
+  clear_multi_selection()
+end
+
+local function quick_categories()
+  local counts = {}
+  for _, e in ipairs(library) do
+    local category = e.category == 'Effects' and e.subcategory or e.category
+    counts[category] = (counts[category] or 0) + 1
+  end
+  local categories = {}
+  for category, count in pairs(counts) do
+    categories[#categories + 1] = { name = category, count = count }
+  end
+  table.sort(categories, function(a, b)
+    if a.count == b.count then return a.name:lower() < b.name:lower() end
+    return a.count > b.count
+  end)
+
+  local quick, seen = {}, {}
+  local limit = cfg.cur_vendor == 'All' and 4 or 3
+  for i = 1, math.min(limit, #categories) do
+    local category = categories[i].name
+    quick[#quick + 1] = category
+    seen[category] = true
+  end
+  if cfg.cur_category ~= 'All' and not seen[cfg.cur_category] then
+    if #quick >= limit then table.remove(quick) end
+    quick[#quick + 1] = cfg.cur_category
+  end
+  return quick
 end
 
 ---------------------------------------------------------------------
@@ -1216,7 +1489,8 @@ local function draw_drag_ghost()
     if drag.target then
       ImGui.TextColored(ctx, C('accent'), '-> ' .. fit_text(drag.target, 170 * scale))
     else
-      ImGui.TextDisabled(ctx, 'Drop on a track')
+      ImGui.TextDisabled(ctx, HAS_JS_WINDOW and 'Drop on a track or FX chain'
+        or 'Drop on a track (FX-chain drops need js_ReaScriptAPI)')
     end
     ImGui.End(ctx)
   end
@@ -1259,7 +1533,8 @@ local MODIFIER_VKEYS = {
 local function is_modifier_down(name)
   local modifier_name = name == 'Ctrl' and 'Mod_Ctrl' or 'Mod_Alt'
   local modifier_fn = ImGui[modifier_name]
-  if modifier_fn and ImGui.IsKeyDown(ctx, modifier_fn()) then return true end
+  if modifier_fn and ImGui.GetKeyMods
+      and (ImGui.GetKeyMods(ctx) & modifier_fn()) ~= 0 then return true end
 
   for _, side in ipairs({ 'Left', 'Right' }) do
     local key_fn = r['ImGui_Key_' .. side .. name] or ImGui['Key_' .. side .. name]
@@ -1277,7 +1552,6 @@ local function is_modifier_down(name)
 end
 
 local function is_ctrl_down() return is_modifier_down('Ctrl') end
-local function is_alt_down() return is_modifier_down('Alt') end
 
 local function queue_screenshots(entries)
   if not HAS_JS then
@@ -1331,7 +1605,6 @@ local function browser_mode_button(mode)
       ImGui.DrawList_AddLine(dl, x + size * 0.42, ly, x + size * 0.74, ly, fg, 1.8 * scale)
     end
   end
-  if hovered then ImGui.SetTooltip(ctx, mode .. ' view') end
   if clicked then set_browser_view(mode) end
 end
 
@@ -1368,8 +1641,96 @@ local function grid_size_slider()
     ImGui.DrawList_AddCircleFilled(dl, knob_x, center_y, 10 * scale, (C('accent') & 0xFFFFFF00) | 0x30, 24)
   end
   ImGui.DrawList_AddCircleFilled(dl, knob_x, center_y, 6 * scale, C('accent'), 24)
-  if hovered then
-    ImGui.SetTooltip(ctx, 'Drag to resize; Ctrl+scroll to zoom. At minimum, the browser switches to List.')
+end
+
+local function filter_icon_button()
+  local scale = cfg.ui_scale
+  local size = 28 * scale
+  local x, y = ImGui.GetCursorScreenPos(ctx)
+  local clicked = ImGui.InvisibleButton(ctx, '##filter_options', size, size)
+  local hovered = ImGui.IsItemHovered(ctx)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local active = cfg.cur_category ~= 'All' or cfg.cur_vendor ~= 'All'
+  local bg = active and C('accent') or (hovered and C('button_hover') or C('button'))
+  ImGui.DrawList_AddRectFilled(dl, x, y, x + size, y + size, bg, 6 * scale)
+  local icon = active and C('window_bg') or C('text_dim')
+  ImGui.DrawList_AddLine(dl, x + 7 * scale, y + 8 * scale, x + 21 * scale, y + 8 * scale, icon, 1.6 * scale)
+  ImGui.DrawList_AddLine(dl, x + 9 * scale, y + 13 * scale, x + 19 * scale, y + 13 * scale, icon, 1.6 * scale)
+  ImGui.DrawList_AddLine(dl, x + 11 * scale, y + 18 * scale, x + 17 * scale, y + 18 * scale, icon, 1.6 * scale)
+  ImGui.DrawList_AddLine(dl, x + 14 * scale, y + 18 * scale, x + 14 * scale, y + 21 * scale, icon, 1.6 * scale)
+  if hovered then ImGui.SetTooltip(ctx, 'Category and vendor filters') end
+  return clicked
+end
+
+local function filter_chip(id, label, selected)
+  local scale = cfg.ui_scale
+  local text_w, text_h = ImGui.CalcTextSize(ctx, label)
+  local width, height = text_w + 18 * scale, 26 * scale
+  local x, y = ImGui.GetCursorScreenPos(ctx)
+  local clicked = ImGui.InvisibleButton(ctx, '##filter_chip_' .. id, width, height)
+  local hovered = ImGui.IsItemHovered(ctx)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local bg = selected and C('accent') or (hovered and C('button_hover') or C('control_bg'))
+  local fg = selected and C('window_bg') or C('text')
+  local border = selected and C('accent') or C('separator')
+  ImGui.DrawList_AddRectFilled(dl, x, y, x + width, y + height, bg, height / 2)
+  ImGui.DrawList_AddRect(dl, x, y, x + width, y + height, border, height / 2, 0, scale)
+  ImGui.DrawList_AddText(dl, x + 9 * scale, y + (height - text_h) / 2, fg, label)
+  return clicked
+end
+
+local function filter_options(filters, placeholder)
+  local options, values = { placeholder }, { 'All' }
+  for i = 2, #filters do
+    options[#options + 1] = filters[i]
+    values[#values + 1] = filters[i]
+  end
+  return options, values
+end
+
+local function draw_filter_toolbar()
+  if filter_icon_button() then ImGui.OpenPopup(ctx, 'Browser filters') end
+  if ImGui.BeginPopup(ctx, 'Browser filters') then
+    local category_options, category_values = filter_options(CATEGORY_FILTERS, 'Category')
+    local category_index = 0
+    for i, value in ipairs(category_values) do
+      if value == cfg.cur_category then category_index = i - 1; break end
+    end
+    ImGui.SetNextItemWidth(ctx, 230 * cfg.ui_scale)
+    local category_changed, new_category = ImGui.Combo(
+      ctx, '##filter_category', category_index, table.concat(category_options, '\0') .. '\0')
+    if category_changed then set_category_filter(category_values[new_category + 1]) end
+
+    local vendor_options, vendor_values = filter_options(VENDOR_FILTERS, 'Vendor')
+    local vendor_index = 0
+    for i, value in ipairs(vendor_values) do
+      if value:lower() == cfg.cur_vendor:lower() then vendor_index = i - 1; break end
+    end
+    ImGui.SetNextItemWidth(ctx, 230 * cfg.ui_scale)
+    local vendor_changed, new_vendor = ImGui.Combo(
+      ctx, '##filter_vendor', vendor_index, table.concat(vendor_options, '\0') .. '\0')
+    if vendor_changed then set_vendor_filter(vendor_values[new_vendor + 1]) end
+
+    if ImGui.Button(ctx, 'Clear filters') then
+      set_category_filter('All')
+      set_vendor_filter('All')
+      ImGui.CloseCurrentPopup(ctx)
+    end
+    ImGui.EndPopup(ctx)
+  end
+
+  for _, category in ipairs(quick_categories()) do
+    ImGui.SameLine(ctx)
+    if filter_chip('category_' .. category, category, cfg.cur_category == category) then
+      set_category_filter(cfg.cur_category == category and 'All' or category)
+    end
+  end
+  if cfg.cur_vendor ~= 'All' then
+    ImGui.SameLine(ctx)
+    local label = fit_text('Vendor: ' .. cfg.cur_vendor, 140 * cfg.ui_scale)
+    if filter_chip('active_vendor', label, true) then
+      set_vendor_filter('All')
+    end
   end
 end
 
@@ -1394,7 +1755,8 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
   last_cols = cols
   local tw = list_mode and math.floor(avail_w)
     or math.max(1, math.floor((avail_w - (cols - 1) * gap) / cols))
-  local label_h = not list_mode and cfg.show_names and (ImGui.GetTextLineHeight(ctx) + 8 * scale) or 0
+  local label_h = not list_mode and cfg.show_names
+    and (2 * ImGui.GetTextLineHeight(ctx) + 10 * scale) or 0
   local th
   if list_mode then
     th = math.max(64 * scale, 2 * ImGui.GetTextLineHeight(ctx) + 10 * scale)
@@ -1524,7 +1886,7 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
       local s = math.min(image_area_w / iw, image_area_h / ih)
       local dw, dh = iw * s, ih * s
       local ix = list_mode and (x + 8 * scale + (image_area_w - dw) / 2) or (x + (tw - dw) / 2)
-      local iy = y + (th - dh) / 2
+      local iy = y + (ah - dh) / 2
       ImGui.DrawList_AddImage(dl, img, ix, iy, ix + dw, iy + dh)
     elseif not lightweight then
       if list_mode then
@@ -1547,7 +1909,7 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
       local name = fit_text(e.display, text_w)
       local _, name_h = ImGui.CalcTextSize(ctx, name)
       local category = (e.category == 'Effects') and ('Effects / ' .. (e.subcategory or '')) or (e.category or '')
-      local detail = (e.type or '') .. '  |  ' .. category
+      local detail = (e.type or '') .. '  |  ' .. category .. '  |  ' .. e.vendor
       local group_text = table.concat(e.groups, ', ')
       if group_text ~= '' then detail = detail .. '  |  ' .. group_text end
       detail = fit_text(detail, text_w)
@@ -1561,7 +1923,12 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
       local t = fit_text(e.display, tw - 10 * scale)
       local lw, lh = ImGui.CalcTextSize(ctx, t)
       local col = installed[e.name] and C('tile_text') or C('tile_missing')
-      ImGui.DrawList_AddText(dl, x + (tw - lw) / 2, y + ah + (label_h - lh) / 2 - 1, col, t)
+      local name_y = y + ah + 2 * scale
+      ImGui.DrawList_AddText(dl, x + (tw - lw) / 2, name_y, col, t)
+      local vendor = fit_text(e.vendor, tw - 10 * scale)
+      local vw = ImGui.CalcTextSize(ctx, vendor)
+      ImGui.DrawList_AddText(
+        dl, x + (tw - vw) / 2, name_y + lh + 2 * scale, C('text_dim'), vendor)
     end
 
     if drag and drag.moved and drag.e == e then
@@ -1578,25 +1945,19 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
       ImGui.DrawList_AddLine(dl, bx + 6 * scale, by + 10 * scale, bx + 12 * scale, by + 4 * scale, C('window_bg'), 1.5 * scale)
     end
     if hovered and not (drag and drag.moved) then
-      local category = (e.category == 'Effects') and ('Effects / ' .. e.subcategory) or e.category
-      local capture_hint = HAS_JS and '\nRight-click for screenshot options'
-        or '\nScreenshot capture requires js_ReaScriptAPI'
-      local group_text = table.concat(e.groups, ', ')
-      ImGui.SetTooltip(ctx, e.name .. '\nCategory: ' .. category ..
-        (group_text ~= '' and ('\nGroups: ' .. group_text) or '') ..
-        '\nAlt-click to select/deselect; right-click for group and screenshot options' .. capture_hint)
+      ImGui.SetTooltip(ctx, e.name)
     end
     local item_activated = ImGui.IsItemActivated(ctx)
     if item_activated then
-      local alt_down = is_alt_down()
-      if alt_down then
+      local ctrl_down = is_ctrl_down()
+      if ctrl_down then
         toggle_multi_selection(e.name)
       else
         clear_multi_selection()
       end
       drag = {
-        e = e, moved = false, select_only = alt_down,
-        double_clicked = not alt_down and ImGui.IsMouseDoubleClicked(ctx, 0),
+        e = e, moved = false, select_only = ctrl_down,
+        double_clicked = not ctrl_down and ImGui.IsMouseDoubleClicked(ctx, 0),
       }
       sel = i
     end
@@ -1612,6 +1973,19 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
 
     if ImGui.BeginPopupContextItem(ctx) then
       if ImGui.MenuItem(ctx, 'Add to project') then want = e end
+      if ImGui.MenuItem(ctx, 'Rename plugin...') then
+        rename_plugin_name = e.name
+        local override = metadata_overrides[e.name]
+        rename_plugin_value = override and override.display or e.display
+        rename_plugin_requested = true
+      end
+      if ImGui.MenuItem(ctx, 'Edit category and vendor...') then
+        local override = metadata_overrides[e.name]
+        metadata_edit_name = e.name
+        metadata_edit_category = override and override.category or 'Automatic'
+        metadata_edit_vendor = e.vendor
+        metadata_edit_requested = true
+      end
       local capture_targets = multi_selected[e.name] and get_multi_selected_entries() or { e }
       local capture_label = #capture_targets > 1
         and ('Capture selected screenshots (' .. #capture_targets .. ')') or 'Capture screenshot'
@@ -1630,7 +2004,9 @@ local function draw_browser(items, deferred, kb_moved, lightweight, random_moved
             save_library()
           end
         end
-        for _, gname in ipairs(groups) do
+        local group_names = { FAVORITES_GROUP }
+        for _, gname in ipairs(groups) do group_names[#group_names + 1] = gname end
+        for _, gname in ipairs(group_names) do
           local all_have, any_have = true, false
           for _, target in ipairs(group_targets) do
             local has_group = entry_has_group(target, gname)
@@ -1745,6 +2121,129 @@ local function draw_manage()
       r.ShowConsoleMsg('Visual Plugin Picker (manage list): ' .. tostring(err) .. '\n')
     end
   end
+end
+
+local function draw_metadata_editor()
+  if metadata_edit_requested then
+    ImGui.OpenPopup(ctx, 'Edit category and vendor')
+    metadata_edit_requested = false
+  end
+  if not metadata_edit_name then return end
+
+  local visible, open = ImGui.BeginPopupModal(
+    ctx, 'Edit category and vendor', true, ImGui.WindowFlags_AlwaysAutoResize())
+  if not open then metadata_edit_name = nil end
+  if not visible then return end
+  if not open then
+    ImGui.EndPopup(ctx)
+    return
+  end
+
+  local entry = lib_index[metadata_edit_name]
+  if entry then
+    ImGui.TextWrapped(ctx, entry.name)
+    ImGui.Separator(ctx)
+    local entry_type, detected_display = parse_name(entry.name)
+    local detected_vendor = classify_vendor(detected_display, entry_type)
+
+    local category_index = 0
+    for i, category in ipairs(CATEGORY_EDIT_OPTIONS) do
+      if category == metadata_edit_category then category_index = i - 1; break end
+    end
+    ImGui.SetNextItemWidth(ctx, 250 * cfg.ui_scale)
+    local category_changed, new_category = ImGui.Combo(
+      ctx, 'Category', category_index, table.concat(CATEGORY_EDIT_OPTIONS, '\0') .. '\0')
+    if category_changed then metadata_edit_category = CATEGORY_EDIT_OPTIONS[new_category + 1] or 'Automatic' end
+
+    ImGui.SetNextItemWidth(ctx, 250 * cfg.ui_scale)
+    local vendor_changed, new_vendor = ImGui.InputTextWithHint(
+      ctx, 'Vendor', 'Blank uses the detected vendor', metadata_edit_vendor)
+    if vendor_changed then metadata_edit_vendor = new_vendor end
+    ImGui.TextDisabled(ctx, 'Detected vendor: ' .. detected_vendor)
+    if ImGui.Button(ctx, 'Use detected') then
+      metadata_edit_vendor = detected_vendor
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Save') and update_plugin_metadata(
+      metadata_edit_name, metadata_edit_category, metadata_edit_vendor) then
+      metadata_edit_name = nil
+      ImGui.CloseCurrentPopup(ctx)
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Cancel') then
+      metadata_edit_name = nil
+      ImGui.CloseCurrentPopup(ctx)
+    end
+  else
+    ImGui.TextDisabled(ctx, 'This plugin is no longer in the library.')
+    if ImGui.Button(ctx, 'Close') then
+      metadata_edit_name = nil
+      ImGui.CloseCurrentPopup(ctx)
+    end
+  end
+
+  if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape()) then
+    metadata_edit_name = nil
+    ImGui.CloseCurrentPopup(ctx)
+  end
+  ImGui.EndPopup(ctx)
+end
+
+local function draw_rename_plugin_editor()
+  if rename_plugin_requested then
+    ImGui.OpenPopup(ctx, 'Rename plugin')
+    rename_plugin_requested = false
+  end
+  if not rename_plugin_name then return end
+
+  local visible, open = ImGui.BeginPopupModal(
+    ctx, 'Rename plugin', true, ImGui.WindowFlags_AlwaysAutoResize())
+  if not open then rename_plugin_name = nil end
+  if not visible then return end
+  if not open then
+    ImGui.EndPopup(ctx)
+    return
+  end
+
+  local entry = lib_index[rename_plugin_name]
+  if entry then
+    ImGui.TextWrapped(ctx, 'Original name: ' .. entry.name)
+    ImGui.SetNextItemWidth(ctx, 300 * cfg.ui_scale)
+    local changed, value = ImGui.InputTextWithHint(
+      ctx, '##plugin_display_name', 'Blank restores the detected name', rename_plugin_value)
+    if changed then rename_plugin_value = value end
+    ImGui.TextDisabled(ctx, 'This changes only the name shown in the picker.')
+
+    local save = ImGui.Button(ctx, 'Save')
+      or ImGui.IsKeyPressed(ctx, ImGui.Key_Enter())
+      or ImGui.IsKeyPressed(ctx, ImGui.Key_KeypadEnter())
+    if save then
+      local override = metadata_overrides[rename_plugin_name]
+      local category = override and override.category or 'Automatic'
+      local vendor = override and override.vendor or entry.vendor
+      if update_plugin_metadata(rename_plugin_name, category, vendor, rename_plugin_value) then
+        rename_plugin_name = nil
+        ImGui.CloseCurrentPopup(ctx)
+      end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Cancel') then
+      rename_plugin_name = nil
+      ImGui.CloseCurrentPopup(ctx)
+    end
+  else
+    ImGui.TextDisabled(ctx, 'This plugin is no longer in the library.')
+    if ImGui.Button(ctx, 'Close') then
+      rename_plugin_name = nil
+      ImGui.CloseCurrentPopup(ctx)
+    end
+  end
+
+  if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape()) then
+    rename_plugin_name = nil
+    ImGui.CloseCurrentPopup(ctx)
+  end
+  ImGui.EndPopup(ctx)
 end
 
 ---------------------------------------------------------------------
@@ -2074,7 +2573,9 @@ local function loop()
     else
       -- top bar
       if focus_search then ImGui.SetKeyboardFocusHere(ctx); focus_search = false end
-      ImGui.SetNextItemWidth(ctx, -90 * cfg.ui_scale)
+      local icon_size = 28 * cfg.ui_scale
+      local item_spacing_x = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing())
+      ImGui.SetNextItemWidth(ctx, -(2 * icon_size + 2 * item_spacing_x))
       local ch, txt = ImGui.InputTextWithHint(ctx, '##search', 'Type to search', search)
       if ch then search = txt; sel = 1; clear_multi_selection() end
       ImGui.SameLine(ctx)
@@ -2087,7 +2588,7 @@ local function loop()
       draw_settings()
 
       -- group tabs
-      if cfg.cur_group ~= 'All' then
+      if cfg.cur_group ~= 'All' and cfg.cur_group ~= FAVORITES_GROUP then
         local found = false
         for _, g in ipairs(groups) do if g == cfg.cur_group then found = true end end
         if not found then cfg.cur_group = 'All'; pending_tab = 'All' end
@@ -2099,8 +2600,37 @@ local function loop()
       local rename_requested = false
       local new_group_popup_open = false
       local rename_popup_open = false
-      if ImGui.BeginTabBar(ctx, '##groups') then
-        if ImGui.TabItemButton(ctx, '+', ImGui.TabItemFlags_Trailing()) then
+      if ImGui.BeginTabBar(ctx, '##groups', ImGui.TabBarFlags_Reorderable()) then
+        ImGui.PushStyleColor(ctx, ImGui.Col_Text(), C('text') & 0xFFFFFF00)
+        local add_group_clicked = ImGui.TabItemButton(ctx, '+##add_group', ImGui.TabItemFlags_Trailing())
+        ImGui.PopStyleColor(ctx)
+        local add_group_hovered = ImGui.IsItemHovered(ctx)
+        local min_x, min_y = ImGui.GetItemRectMin(ctx)
+        local max_x, max_y = ImGui.GetItemRectMax(ctx)
+        local icon_x, icon_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+        local icon_col = add_group_hovered and C('accent') or C('text_dim')
+        local dl = ImGui.GetWindowDrawList(ctx)
+        ImGui.DrawList_AddRect(
+          dl, icon_x - 6 * cfg.ui_scale, icon_y - 5 * cfg.ui_scale,
+          icon_x + 2 * cfg.ui_scale, icon_y + 3 * cfg.ui_scale,
+          icon_col, 1.5 * cfg.ui_scale, 0, 1.3 * cfg.ui_scale)
+        ImGui.DrawList_AddRect(
+          dl, icon_x - 2 * cfg.ui_scale, icon_y - 1 * cfg.ui_scale,
+          icon_x + 6 * cfg.ui_scale, icon_y + 7 * cfg.ui_scale,
+          icon_col, 1.5 * cfg.ui_scale, 0, 1.3 * cfg.ui_scale)
+        ImGui.DrawList_AddCircleFilled(
+          dl, icon_x + 5 * cfg.ui_scale, icon_y + 5 * cfg.ui_scale,
+          4 * cfg.ui_scale, C('accent'), 16)
+        ImGui.DrawList_AddLine(
+          dl, icon_x + 5 * cfg.ui_scale, icon_y + 2.5 * cfg.ui_scale,
+          icon_x + 5 * cfg.ui_scale, icon_y + 7.5 * cfg.ui_scale, C('window_bg'), 1.2 * cfg.ui_scale)
+        ImGui.DrawList_AddLine(
+          dl, icon_x + 2.5 * cfg.ui_scale, icon_y + 5 * cfg.ui_scale,
+          icon_x + 7.5 * cfg.ui_scale, icon_y + 5 * cfg.ui_scale, C('window_bg'), 1.2 * cfg.ui_scale)
+        if add_group_hovered then
+          ImGui.SetTooltip(ctx, 'Create a group to organize plugins')
+        end
+        if add_group_clicked then
           new_group_name = ''
           ImGui.OpenPopup(ctx, 'NewGroup')
         end
@@ -2111,7 +2641,8 @@ local function loop()
           local _, gtxt = ImGui.InputTextWithHint(ctx, '##gname', 'Group name', new_group_name)
           new_group_name = gtxt
           local create = ImGui.Button(ctx, 'Create') or ImGui.IsKeyPressed(ctx, ImGui.Key_Enter())
-          if create and new_group_name ~= '' and new_group_name ~= 'All' then
+          if create and new_group_name ~= '' and new_group_name ~= 'All'
+             and new_group_name ~= FAVORITES_GROUP then
             local exists = false
             for _, g in ipairs(groups) do if g == new_group_name then exists = true end end
             if not exists then groups[#groups + 1] = new_group_name; save_library() end
@@ -2120,13 +2651,23 @@ local function loop()
           end
           ImGui.EndPopup(ctx)
         end
-        local names = { 'All' }
+        local names = { 'All', FAVORITES_GROUP }
         for _, g in ipairs(groups) do names[#names + 1] = g end
+        local group_tab_positions = {}
         for _, gname in ipairs(names) do
-          local flags = 0
-          if pending_tab == gname then flags = ImGui.TabItemFlags_SetSelected() end
-          local active = ImGui.BeginTabItem(ctx, gname, nil, flags)
-          if gname ~= 'All' and ImGui.BeginPopupContextItem(ctx) then
+          local pinned = gname == 'All' or gname == FAVORITES_GROUP
+          local flags = pinned and ImGui.TabItemFlags_NoReorder() or 0
+          if pending_tab == gname then flags = flags | ImGui.TabItemFlags_SetSelected() end
+          local is_favorites = gname == FAVORITES_GROUP
+          local tab_label = (is_favorites and '      ' or '') .. gname .. '###group_tab_' .. gname
+          local active = ImGui.BeginTabItem(ctx, tab_label, nil, flags)
+          local tab_x, tab_y = ImGui.GetItemRectMin(ctx)
+          local _, tab_max_y = ImGui.GetItemRectMax(ctx)
+          local tab_hovered = ImGui.IsItemHovered(ctx)
+          if gname ~= 'All' and not is_favorites then
+            group_tab_positions[#group_tab_positions + 1] = { name = gname, x = tab_x }
+          end
+          if not pinned and ImGui.BeginPopupContextItem(ctx) then
             if ImGui.MenuItem(ctx, 'Rename group...') then
               rename_group_original = gname
               rename_group_name = gname
@@ -2142,6 +2683,16 @@ local function loop()
             end
             ImGui.EndPopup(ctx)
           end
+          if is_favorites then
+            local scale = cfg.ui_scale
+            local star_size = 14 * scale
+            local star_x = tab_x + 3 * scale
+            local star_y = tab_y + ((tab_max_y - tab_y) - star_size) / 2
+            local star_color = active and C('accent')
+              or (tab_hovered and C('text') or C('text_dim'))
+            draw_favorites_star(
+              ImGui.GetWindowDrawList(ctx), star_x, star_y, star_size, star_color)
+          end
           if active then
             if cfg.cur_group ~= gname then
               cfg.cur_group = gname
@@ -2153,6 +2704,18 @@ local function loop()
         end
         pending_tab = nil
         ImGui.EndTabBar(ctx)
+        if #group_tab_positions == #groups then
+          table.sort(group_tab_positions, function(a, b) return a.x < b.x end)
+          local changed = false
+          for i, tab in ipairs(group_tab_positions) do
+            if groups[i] ~= tab.name then changed = true; break end
+          end
+          if changed then
+            for i, tab in ipairs(group_tab_positions) do groups[i] = tab.name end
+            save_library()
+            set_status('Reordered groups.')
+          end
+        end
       end
 
       if rename_requested then ImGui.OpenPopup(ctx, 'RenameGroup') end
@@ -2170,9 +2733,12 @@ local function loop()
             break
           end
         end
-        local invalid = rename_group_name == '' or rename_group_name == 'All' or duplicate
+        local reserved = rename_group_name == 'All' or rename_group_name == FAVORITES_GROUP
+        local invalid = rename_group_name == '' or reserved or duplicate
         if invalid then
-          ImGui.TextDisabled(ctx, duplicate and 'That group name already exists.' or 'Enter a valid group name.')
+          local message = duplicate and 'That group name already exists.'
+            or (reserved and 'That group name is reserved.' or 'Enter a valid group name.')
+          ImGui.TextDisabled(ctx, message)
         end
 
         local commit = ImGui.Button(ctx, 'Rename') or ImGui.IsKeyPressed(ctx, ImGui.Key_Enter())
@@ -2215,19 +2781,15 @@ local function loop()
         ImGui.EndPopup(ctx)
       end
 
-      local category_index = 0
-      for i, category in ipairs(CATEGORY_FILTERS) do
-        if category == cfg.cur_category then category_index = i - 1; break end
-      end
-      ImGui.SetNextItemWidth(ctx, 170 * cfg.ui_scale)
-      local category_changed, new_category = ImGui.Combo(
-        ctx, '##category', category_index, table.concat(CATEGORY_FILTERS, '\0') .. '\0')
-      if category_changed then
-        cfg.cur_category = CATEGORY_FILTERS[new_category + 1] or 'All'
-        sel = 1
-        clear_multi_selection()
-      end
+      draw_filter_toolbar()
       ImGui.SameLine(ctx)
+      local control_spacing = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing())
+      local slider_width = 180 * cfg.ui_scale
+      local control_group_width = 2 * 28 * cfg.ui_scale + slider_width + 2 * control_spacing
+      local remaining_width = ImGui.GetContentRegionAvail(ctx)
+      if remaining_width >= control_group_width then
+        ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + remaining_width - control_group_width)
+      end
       browser_mode_button('List')
       ImGui.SameLine(ctx)
       grid_size_slider()
@@ -2235,6 +2797,12 @@ local function loop()
       browser_mode_button('Grid')
 
       local items = visible_items()
+      if pending_selected_plugin then
+        for i, item in ipairs(items) do
+          if item.name == pending_selected_plugin then sel = i; break end
+        end
+        pending_selected_plugin = nil
+      end
       if sel > #items then sel = #items end
       if sel < 1 then sel = 1 end
 
@@ -2250,11 +2818,13 @@ local function loop()
       end
       if (ImGui.IsKeyPressed(ctx, ImGui.Key_Enter()) or ImGui.IsKeyPressed(ctx, ImGui.Key_KeypadEnter()))
          and items[sel] and not new_group_popup_open
-         and not rename_popup_open then
+         and not rename_popup_open and not metadata_edit_name and not rename_plugin_name then
         want = items[sel]
       end
       if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape()) then
-        if search ~= '' then search = ''; sel = 1 else open = false end
+        if not metadata_edit_name and not rename_plugin_name then
+          if search ~= '' then search = ''; sel = 1 else open = false end
+        end
       end
 
       -- browser
@@ -2265,11 +2835,16 @@ local function loop()
         want = want or w
         ImGui.EndChild(ctx)
       end
+      draw_metadata_editor()
+      draw_rename_plugin_editor()
       if handle_drag() and cfg.close_after then open = false end
 
       -- footer
       local button_size = 44 * cfg.ui_scale
       local button_x = ImGui.GetWindowWidth(ctx) - button_size - 14 * cfg.ui_scale
+      local footer_row_y = ImGui.GetCursorPosY(ctx)
+      local control_y = footer_row_y + math.max(0, (button_size - ImGui.GetFrameHeight(ctx)) / 2)
+      ImGui.SetCursorPosY(ctx, control_y)
       ImGui.SetNextItemWidth(ctx, 190 * cfg.ui_scale)
       local tch, tnew = ImGui.Combo(ctx, '##target', math.floor(cfg.target), TARGET_ITEMS)
       if tch then cfg.target = tnew end
@@ -2285,6 +2860,7 @@ local function loop()
         ImGui.TextDisabled(ctx, footer_text)
       end
       ImGui.SameLine(ctx)
+      ImGui.SetCursorPosY(ctx, footer_row_y)
       ImGui.SetCursorPosX(ctx, button_x)
       if random_plugin_button(#items > 0) then
         if #items > 1 then
@@ -2322,6 +2898,7 @@ math.randomseed(os.time())
 migrate_data_to_documents()
 load_saved_color_themes()
 load_cfg()
+load_metadata_overrides()
 if cfg.auto_theme then
   apply_auto_color_theme()
   next_auto_theme_check = r.time_precise() + 30
