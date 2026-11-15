@@ -145,6 +145,9 @@ local frame_dt = 1 / 30
 local last_frame_time = r.time_precise()
 local last_picker_x, last_picker_y, last_mouse_x, last_mouse_y
 local lightweight_until = 0
+local group_tab_dragging = false
+local group_tab_drag_source = nil
+local group_tab_highlight = nil
 
 ---------------------------------------------------------------------
 -- Settings
@@ -2576,9 +2579,44 @@ local function loop()
       local icon_size = 28 * cfg.ui_scale
       local item_spacing_x = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing())
       ImGui.SetNextItemWidth(ctx, -(2 * icon_size + 2 * item_spacing_x))
+      if search ~= '' then ImGui.SetNextItemAllowOverlap(ctx) end
       local ch, txt = ImGui.InputTextWithHint(ctx, '##search', 'Type to search', search)
       if ch then search = txt; sel = 1; clear_multi_selection() end
-      ImGui.SameLine(ctx)
+      local min_x, min_y = ImGui.GetItemRectMin(ctx)
+      local max_x, max_y = ImGui.GetItemRectMax(ctx)
+      local search_height = max_y - min_y
+      local toolbar_y = min_y + (search_height - icon_size) / 2
+      if search ~= '' then
+        local scale = cfg.ui_scale
+        local clear_size = 18 * scale
+        local clear_x = max_x - clear_size - 4 * scale
+        local clear_y = min_y + ((max_y - min_y) - clear_size) / 2
+        ImGui.SetCursorScreenPos(ctx, clear_x, clear_y)
+        local clicked = ImGui.InvisibleButton(ctx, '##clear_search', clear_size, clear_size)
+        local hovered = ImGui.IsItemHovered(ctx)
+        local dl = ImGui.GetWindowDrawList(ctx)
+        local color = hovered and C('text') or C('text_dim')
+        ImGui.DrawList_AddRectFilled(
+          dl, clear_x, clear_y, clear_x + clear_size, clear_y + clear_size,
+          C('control_bg'), 3 * scale)
+        local inset = 5 * scale
+        ImGui.DrawList_AddLine(
+          dl, clear_x + inset, clear_y + inset, clear_x + clear_size - inset,
+          clear_y + clear_size - inset, color, 1.6 * scale)
+        ImGui.DrawList_AddLine(
+          dl, clear_x + clear_size - inset, clear_y + inset,
+          clear_x + inset, clear_y + clear_size - inset, color, 1.6 * scale)
+        if hovered then
+          ImGui.SetTooltip(ctx, 'Clear search')
+        end
+        if clicked then
+          search = ''
+          sel = 1
+          clear_multi_selection()
+          focus_search = true
+        end
+      end
+      ImGui.SetCursorScreenPos(ctx, max_x + item_spacing_x, toolbar_y)
       if toolbar_icon_button('##add_plugins', 'Add plugins', 'add') then view = 'manage' end
       ImGui.SameLine(ctx)
       if toolbar_icon_button('##settings', 'Settings', 'settings') then
@@ -2653,6 +2691,11 @@ local function loop()
         end
         local names = { 'All', FAVORITES_GROUP }
         for _, g in ipairs(groups) do names[#names + 1] = g end
+        if not ImGui.IsMouseDown(ctx, ImGui.MouseButton_Left()) then
+          group_tab_dragging = false
+          group_tab_drag_source = nil
+          group_tab_highlight = nil
+        end
         local group_tab_positions = {}
         for _, gname in ipairs(names) do
           local pinned = gname == 'All' or gname == FAVORITES_GROUP
@@ -2662,10 +2705,54 @@ local function loop()
           local tab_label = (is_favorites and '      ' or '') .. gname .. '###group_tab_' .. gname
           local active = ImGui.BeginTabItem(ctx, tab_label, nil, flags)
           local tab_x, tab_y = ImGui.GetItemRectMin(ctx)
-          local _, tab_max_y = ImGui.GetItemRectMax(ctx)
-          local tab_hovered = ImGui.IsItemHovered(ctx)
+          local tab_max_x, tab_max_y = ImGui.GetItemRectMax(ctx)
+          local tab_hovered = ImGui.IsItemHovered(
+            ctx, ImGui.HoveredFlags_AllowWhenBlockedByActiveItem())
+          if not pinned and ImGui.IsItemActive(ctx)
+             and ImGui.IsMouseDragging(ctx, ImGui.MouseButton_Left()) then
+            group_tab_dragging = true
+            group_tab_drag_source = gname
+          end
           if gname ~= 'All' and not is_favorites then
             group_tab_positions[#group_tab_positions + 1] = { name = gname, x = tab_x }
+          end
+          if group_tab_dragging and not pinned and gname == group_tab_drag_source then
+            local dl = ImGui.GetWindowDrawList(ctx)
+            ImGui.DrawList_AddRectFilled(
+              dl, tab_x + 1, tab_y + 1, tab_max_x - 1, tab_max_y - 1,
+              (C('accent') & 0xFFFFFF00) | 0x18, 5 * cfg.ui_scale)
+          end
+          if group_tab_dragging and not pinned and tab_hovered then
+            local target_x, target_y = tab_x, tab_y
+            local target_w, target_h = tab_max_x - tab_x, tab_max_y - tab_y
+            if not group_tab_highlight then
+              group_tab_highlight = {
+                x = target_x, y = target_y, w = target_w, h = target_h,
+              }
+            elseif cfg.smooth_animations then
+              local alpha = 1 - math.exp(-frame_dt / 0.045)
+              group_tab_highlight.x = group_tab_highlight.x
+                + (target_x - group_tab_highlight.x) * alpha
+              group_tab_highlight.y = group_tab_highlight.y
+                + (target_y - group_tab_highlight.y) * alpha
+              group_tab_highlight.w = group_tab_highlight.w
+                + (target_w - group_tab_highlight.w) * alpha
+              group_tab_highlight.h = group_tab_highlight.h
+                + (target_h - group_tab_highlight.h) * alpha
+            else
+              group_tab_highlight.x, group_tab_highlight.y = target_x, target_y
+              group_tab_highlight.w, group_tab_highlight.h = target_w, target_h
+            end
+            local highlight = group_tab_highlight
+            local dl = ImGui.GetWindowDrawList(ctx)
+            ImGui.DrawList_AddRectFilled(
+              dl, highlight.x + 1, highlight.y + 1,
+              highlight.x + highlight.w - 1, highlight.y + highlight.h - 1,
+              (C('accent') & 0xFFFFFF00) | 0x24, 5 * cfg.ui_scale)
+            ImGui.DrawList_AddRect(
+              dl, highlight.x + 1, highlight.y + 1,
+              highlight.x + highlight.w - 1, highlight.y + highlight.h - 1,
+              C('accent'), 5 * cfg.ui_scale, 0, 1.5 * cfg.ui_scale)
           end
           if not pinned and ImGui.BeginPopupContextItem(ctx) then
             if ImGui.MenuItem(ctx, 'Rename group...') then
